@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import shutil
 import tempfile
@@ -22,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from functools import wraps
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Optional
 from zoneinfo import ZoneInfo
 
@@ -112,7 +114,6 @@ STATE_BACKUP_DIR = Path(
     os.environ.get("STATE_BACKUP_DIR", str(DATA_DIR / "backups"))
 ).expanduser()
 
-SPLIT_SIZE_BYTES = 10 * 1024 * 1024
 AUTO_DELETE_HOURS = 4
 MEDIA_CONCURRENCY = max(2, int(os.environ.get("MEDIA_CONCURRENCY", "8")))
 DEFAULT_MESSAGE_COUNT = 30
@@ -121,6 +122,14 @@ STATE_BACKUP_KEEP = max(2, int(os.environ.get("STATE_BACKUP_KEEP", "14")))
 STATE_BACKUP_INTERVAL_SECONDS = max(
     300, int(os.environ.get("STATE_BACKUP_INTERVAL_SECONDS", str(6 * 3600)))
 )
+TEMP_CLEANUP_INTERVAL_SECONDS = max(
+    60, int(os.environ.get("TEMP_CLEANUP_INTERVAL_SECONDS", "900"))
+)
+# حداکثر حجم واقعی هر فایلی که مستقیماً در بله ارسال می‌شود (سقف واقعی بله ۵۰ مگابایت
+# است؛ کمی پایین‌تر نگه می‌داریم تا حاشیهٔ خطا داشته باشیم).
+BALE_MAX_FILE_BYTES = 47 * 1024 * 1024
+CRASH_RESTART_MIN_DELAY = 5
+CRASH_RESTART_MAX_DELAY = 300
 
 
 def _optional_int_env(name: str) -> Optional[int]:
@@ -157,12 +166,14 @@ def _load_state() -> dict[str, Any]:
             if isinstance(value, dict):
                 value.setdefault("channels", {})
                 value.setdefault("allowed_users", [])
+                value.setdefault("pending_exports", [])
                 return value
         except (OSError, ValueError) as exc:
             logger.warning("could not load state candidate %s: %s", candidate, exc)
     return {
         "channels": {},
         "allowed_users": [],
+        "pending_exports": [],
     }
 
 
@@ -191,6 +202,25 @@ def backup_state() -> None:
                 old.unlink()
     except OSError as exc:
         logger.warning("state backup failed: %s", exc)
+
+
+def _add_pending_export(spec: dict[str, Any]) -> None:
+    """ذخیرهٔ مشخصات یک درخواست export پیش از شروع پردازش؛ اگر ربات وسط کار
+    قطع/کرش شود، بعد از ری‌استارت همین درخواست به‌صورت خودکار از نو صف می‌شود."""
+    state = _load_state()
+    pending = state.setdefault("pending_exports", [])
+    pending[:] = [item for item in pending if item.get("job_id") != spec.get("job_id")]
+    pending.append(spec)
+    _save_state(state)
+
+
+def _remove_pending_export(job_id: str) -> None:
+    state = _load_state()
+    pending = state.get("pending_exports", [])
+    new_pending = [item for item in pending if item.get("job_id") != job_id]
+    if len(new_pending) != len(pending):
+        state["pending_exports"] = new_pending
+        _save_state(state)
 
 
 def _photo_signature(entity: Channel) -> str:
@@ -496,32 +526,40 @@ def create_protected_zip(html_content: str, media_dir: Path, zip_path: Path) -> 
                     zip_file.write(path, arcname=f"media/{path.relative_to(media_dir)}")
 
 
-def split_file(file_path: Path, part_size: int = SPLIT_SIZE_BYTES) -> list[Path]:
-    parts: list[Path] = []
+async def send_file_to_bale(
+    context: ContextTypes.DEFAULT_TYPE, file_path: Path, base_name: str = "export"
+) -> None:
+    """فایل zip را مستقیماً به بله می‌فرستد؛ طبق درخواست، پسوند نهایی همیشه .jpg
+    است (محتوای واقعی همان zip رمزگذاری‌شده می‌ماند، فقط پسوند تغییر می‌کند).
+    اگر حجم از سقف فایل بله (BALE_MAX_FILE_BYTES) بیشتر باشد، فایل پارت‌پارت
+    می‌شود؛ پارت‌ها یکی‌یکی ساخته، ارسال و بلافاصله پاک می‌شوند تا دیسک هاست
+    پر نشود."""
+    size = file_path.stat().st_size
+    if size <= BALE_MAX_FILE_BYTES:
+        with file_path.open("rb") as fh:
+            await context.bot.send_document(
+                chat_id=ADMIN_ID, document=fh, filename=f"{base_name}.jpg"
+            )
+        return
+
+    total_parts = math.ceil(size / BALE_MAX_FILE_BYTES)
     with file_path.open("rb") as source:
-        index = 1
-        while chunk := source.read(part_size):
-            part = Path(f"{file_path}.part{index}")
+        for index in range(1, total_parts + 1):
+            chunk = source.read(BALE_MAX_FILE_BYTES)
+            if not chunk:
+                break
+            part = file_path.with_name(f"{file_path.stem}.part{index}{file_path.suffix}")
             part.write_bytes(chunk)
-            parts.append(part)
-            index += 1
-    return parts
-
-
-async def send_zip_parts_to_bale(context: ContextTypes.DEFAULT_TYPE, zip_path: Path) -> None:
-    parts = split_file(zip_path)
-    total = len(parts)
-    for index, part in enumerate(parts, 1):
-        try:
-            with part.open("rb") as fh:
-                await context.bot.send_document(
-                    chat_id=ADMIN_ID,
-                    document=fh,
-                    filename=f"export_part{index}of{total}.zip",
-                )
-        finally:
-            with contextlib.suppress(OSError):
-                part.unlink()
+            try:
+                with part.open("rb") as fh:
+                    await context.bot.send_document(
+                        chat_id=ADMIN_ID,
+                        document=fh,
+                        filename=f"{base_name}_part{index}of{total_parts}.jpg",
+                    )
+            finally:
+                with contextlib.suppress(OSError):
+                    part.unlink()
 
 
 def upload_with_retry(file_path: str, max_attempts: int = 3) -> str:
@@ -545,6 +583,7 @@ class ExportJob:
     max_zip_mb: int = DEFAULT_MAX_ZIP_MB
     max_media_bytes: Optional[int] = None
     label: str = "export"
+    delivery: str = "upload"  # "upload" (لینک imgurl.ir) یا "direct" (ارسال مستقیم jpg در بله)
     job_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     progress_message_id: Optional[int] = None
     progress: int = 0
@@ -571,6 +610,9 @@ class ExportQueue:
         return position
 
     async def cancel_all(self) -> None:
+        # توجه: این متد فقط هنگام خاموش‌شدن/ری‌استارت خودِ برنامه صدا زده می‌شود
+        # (نه با درخواست کاربر)، بنابراین عمداً pending_exports را پاک نمی‌کند تا
+        # پس از راه‌اندازی دوباره، همین درخواست‌ها خودکار از سر گرفته شوند.
         for job in self.jobs.values():
             job.cancelled = True
             await _show_cancelled_progress(job)
@@ -624,6 +666,7 @@ class ExportQueue:
             return False
         job.cancelled = True
         await _show_cancelled_progress(job)
+        _remove_pending_export(job_id)
         if self.active is job and self.active_task and not self.active_task.done():
             self.active_task.cancel()
         return True
@@ -776,6 +819,18 @@ async def run_export_job(job: ExportJob) -> None:
     work_dir: Optional[Path] = None
     try:
         await _set_progress(job, 5, f"صف {job.label} · {len(job.channels)} کانال")
+
+        if job.delivery == "direct":
+            # حالت ارسال مستقیم: نیازی به محدودسازی حجم زیپ نیست، چون در صورت
+            # لزوم به چند پارت تقسیم می‌شود. تعداد پیام همانی است که کاربر خواسته.
+            work_dir = Path(tempfile.mkdtemp(prefix="tgexport_"))
+            zip_path, _ = await _build_bundle(job, job.count, work_dir, job.max_media_bytes)
+            await _set_progress(job, 65, "بسته آماده شد؛ در حال ارسال مستقیم به بله...")
+            await send_file_to_bale(job.context, zip_path, base_name="export")
+            await _set_progress(job, 100, "✅ export کامل شد و مستقیماً در بله ارسال شد.")
+            return
+
+        # حالت پیش‌فرض: آپلود در imgurl.ir
         zip_path, work_dir, _ = await _fit_bundle(job)
         await _set_progress(job, 65, "بسته آماده شد")
 
@@ -784,11 +839,11 @@ async def run_export_job(job: ExportJob) -> None:
         try:
             cdn_url = await asyncio.to_thread(upload_with_retry, str(upload_copy))
         except Exception:
-            await send_zip_parts_to_bale(job.context, zip_path)
+            await send_file_to_bale(job.context, zip_path, base_name="export")
             await _set_progress(
                 job,
                 100,
-                "✅ آپلود لینک انجام نشد؛ فایل به‌صورت مستقیم ارسال شد.",
+                "✅ آپلود در imgurl.ir انجام نشد؛ فایل به‌صورت مستقیم ارسال شد.",
             )
             return
 
@@ -799,17 +854,34 @@ async def run_export_job(job: ExportJob) -> None:
     finally:
         if work_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
+        # این درخواست دیگر «ناتمام» نیست، چه موفق چه ناموفق؛ اگر واقعاً خطا خورده
+        # باشد، صف export این خطا را جداگانه به ادمین گزارش می‌کند و کاربر می‌تواند
+        # دوباره درخواست بدهد. نگه‌داشتن آن در pending باعث تکرار ناخواستهٔ export
+        # در هر ری‌استارت می‌شود.
+        _remove_pending_export(job.job_id)
 
 
 def cleanup_old_temp_files() -> None:
+    """پاک‌سازی فایل‌های موقتِ ناتمام از پردازش‌های قطع‌شده (مثلاً بعد از یک
+    کرش یا قطعی اینترنت وسط export). هم در استارت‌آپ و هم به‌صورت دوره‌ای
+    اجرا می‌شود تا هیچ فایل نصفه‌کاره‌ای روی هاست باقی نماند."""
+    cutoff = time.time() - AUTO_DELETE_HOURS * 3600
     try:
         root = Path(tempfile.gettempdir())
-        cutoff = time.time() - AUTO_DELETE_HOURS * 3600
-        for path in root.glob("tgexport_*"):
-            if path.stat().st_mtime < cutoff:
-                shutil.rmtree(path, ignore_errors=True)
+        for pattern in ("tgexport_*", "media_*"):
+            for path in root.glob(pattern):
+                with contextlib.suppress(OSError):
+                    if path.stat().st_mtime < cutoff:
+                        shutil.rmtree(path, ignore_errors=True)
     except Exception as exc:
-        logger.warning("cleanup error: %s", exc)
+        logger.warning("cleanup error (tempdir): %s", exc)
+    try:
+        for path in DATA_DIR.glob("avatar_*"):
+            with contextlib.suppress(OSError):
+                if path.stat().st_mtime < cutoff:
+                    shutil.rmtree(path, ignore_errors=True)
+    except Exception as exc:
+        logger.warning("cleanup error (data dir): %s", exc)
 
 
 def _track_message(context: ContextTypes.DEFAULT_TYPE, message_id: int) -> None:
@@ -907,8 +979,11 @@ async def _send_channel_selector(
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.message:
         intro = await update.message.reply_text(
-            "سلام. یک یا چند کانال را با دکمه‌ها انتخاب کنید؛ "
-            "بعد تعداد پیام‌های موردنظر را ارسال کنید."
+            "سلام 👋\n"
+            "1️⃣ یک یا چند کانال را با دکمه‌های زیر تیک بزنید و «ادامه» را بزنید.\n"
+            "2️⃣ تعداد پیام آخر موردنظر از هر کانال را به‌صورت عدد بفرستید.\n"
+            "3️⃣ روش تحویل خروجی (آپلود در imgurl.ir یا ارسال مستقیم jpg) را انتخاب کنید.\n\n"
+            "راهنمای کامل دستورها: /help"
         )
         _track_message(context, intro.message_id)
     channels = await get_channels()
@@ -962,17 +1037,29 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _track_message(context, update.message.message_id)
     message = await update.message.reply_text(
-        "راهنمای دستورها\n\n"
-        "/start — انتخاب هم‌زمان چند کانال با دکمه\n"
-        "/list — نمایش فهرست کانال‌های ذخیره‌شده\n"
-        "/refresh — همگام‌سازی کانال‌ها و پاک‌کردن آواتارهای قدیمی\n"
-        "/export all — خروجی از همهٔ کانال‌ها\n"
-        "/export نام‌کانال — خروجی از یک یا چند کانال مشخص\n"
-        "/setlimit 100 — سقف حجم ZIP برحسب مگابایت\n"
-        "/status — وضعیت صف و کانال‌های فعلی\n"
-        "/Add 12345 — افزودن کاربر مجاز\n"
-        "/j آدرس‌کانال — عضویت در کانال عمومی/خصوصی و دریافت پیام‌های اخیر\n"
-        "/del — پاک‌کردن تک‌تکِ پیام‌های ردیابی‌شدهٔ اخیر",
+        "📖 راهنمای کامل ربات\n\n"
+        "روش معمول کار (پیشنهادی):\n"
+        "1️⃣ /start — انتخاب یک یا چند کانال با دکمه‌های تیک‌دار\n"
+        "2️⃣ عدد تعداد پیام موردنظر را بفرستید (مثلاً 30)\n"
+        "3️⃣ روش تحویل را با دکمه انتخاب کنید:\n"
+        "    📤 آپلود در imgurl.ir → یک متن رمزشده حاوی لینک دریافت می‌کنید\n"
+        "    📎 ارسال مستقیم jpg در بله → فایل (یا چند پارت jpg اگر حجم زیاد بود)"
+        " مستقیماً در همین چت ارسال می‌شود\n\n"
+        "دستورهای مستقیم:\n"
+        "/status — وضعیت لحظه‌ای ربات (روشن/مشغول/بیکار)\n"
+        "/list — فهرست کانال‌های ذخیره‌شده\n"
+        "/refresh — همگام‌سازی دوبارهٔ فهرست کانال‌ها\n"
+        "/export all — خروجی سریع از همهٔ کانال‌ها (پیش‌فرض: آپلود در imgurl.ir)\n"
+        "/export نام‌کانال — خروجی از یک یا چند کانال مشخص با نام\n"
+        "/export all direct — مثل بالا، ولی با ارسال مستقیم jpg به‌جای آپلود\n"
+        "/j آدرس‌یا‌لینک‌کانال — عضویت در کانال عمومی/خصوصی جدید\n"
+        "/setlimit 100 — تنظیم سقف حجم ZIP (مگابایت) برای حالت «آپلود»\n"
+        "/Add 12345 — افزودن یک کاربر مجاز دیگر (با آیدی عددی)\n"
+        "/del — پاک‌کردن پیام‌های اخیر ردیابی‌شدهٔ همین ربات از این چت\n\n"
+        "نکات:\n"
+        "• فقط ادمین و کاربرهای اضافه‌شده با /Add به ربات دسترسی دارند؛ بقیه نادیده گرفته می‌شوند.\n"
+        "• اگر ربات وسط کار قطع شود، بعد از بالا آمدن دوباره، خودش export ناتمام را از سر می‌گیرد.\n"
+        "• هر فایل موقتی که ارسال یا آپلود شود، بلافاصله از روی هاست پاک می‌شود.",
     )
     _track_message(context, message.message_id)
 
@@ -983,15 +1070,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     channels = await get_channels()
     queue = _queue(context.application)
     active = queue.active
-    active_text = (
-        f"{active.label} ({active.job_id}) · {active.progress}%"
-        if active
-        else "ندارد"
-    )
+    if active:
+        state_line = f"🔴 مشغول است — در حال {active.label} ({active.job_id}) · {active.progress}٪"
+    elif queue.queue.qsize() > 0:
+        state_line = "🟡 روشن است — کاری در صف منتظر شروع است"
+    else:
+        state_line = "🟢 روشن و بیکار — آمادهٔ دریافت درخواست جدید"
     message = await update.message.reply_text(
-        "وضعیت فعلی\n\n"
-        f"کانال‌های فعلی: {len(channels)}\n"
-        f"پردازش فعال: {active_text}\n"
+        "وضعیت فعلی ربات\n\n"
+        f"{state_line}\n\n"
+        f"کانال‌های ذخیره‌شده: {len(channels)}\n"
         f"در صف انتظار: {queue.queue.qsize()}\n"
         f"سقف ZIP: {context.application.bot_data.get('max_zip_mb', DEFAULT_MAX_ZIP_MB)} MB\n"
         f"سقف رسانه: {_format_bytes(DEFAULT_MAX_MEDIA_BYTES) if DEFAULT_MAX_MEDIA_BYTES else 'بدون سقف'}",
@@ -1019,6 +1107,10 @@ def _format_bytes(value: Optional[int]) -> str:
     return f"{value / 1024:.0f} KB"
 
 
+def _delivery_label(delivery: str) -> str:
+    return "آپلود در imgurl.ir (لینک رمزشده)" if delivery == "upload" else "ارسال مستقیم فایل jpg در بله"
+
+
 async def _enqueue_job(
     context: ContextTypes.DEFAULT_TYPE,
     channels: list[dict[str, Any]],
@@ -1027,6 +1119,7 @@ async def _enqueue_job(
     count: int = DEFAULT_MESSAGE_COUNT,
     max_zip_mb: int = DEFAULT_MAX_ZIP_MB,
     max_media_bytes: Optional[int] = None,
+    delivery: str = "upload",
 ) -> None:
     if not channels:
         message = await context.bot.send_message(
@@ -1045,6 +1138,20 @@ async def _enqueue_job(
         max_zip_mb=max_zip_mb,
         max_media_bytes=max_media_bytes if max_media_bytes is not None else DEFAULT_MAX_MEDIA_BYTES,
         label=label,
+        delivery=delivery if delivery in ("upload", "direct") else "upload",
+    )
+    # پیش از هر کار سنگین، مشخصات این درخواست را ذخیره می‌کنیم؛ اگر ربات وسط
+    # کار قطع/کرش شود، بعد از ری‌استارت خودکار از همین‌جا دوباره صف می‌شود.
+    _add_pending_export(
+        {
+            "job_id": job.job_id,
+            "channels": channels,
+            "label": label,
+            "count": count,
+            "max_zip_mb": max_zip_mb,
+            "max_media_bytes": job.max_media_bytes,
+            "delivery": job.delivery,
+        }
     )
     channel_names = "، ".join(channel["title"] for channel in channels)
     request_message = await context.bot.send_message(
@@ -1053,6 +1160,7 @@ async def _enqueue_job(
             f"📥 درخواست {label} ثبت شد.\n"
             f"کانال‌ها: {channel_names}\n"
             f"محدوده: {count} پیام از هر کانال\n"
+            f"روش تحویل: {_delivery_label(job.delivery)}\n"
             "دانلود رسانه‌ها به‌صورت هم‌زمان انجام می‌شود."
         ),
     )
@@ -1082,7 +1190,15 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     channels = await get_channels()
     if not channels:
         channels = await refresh_channels()
-    selectors = [token.lstrip("@").casefold() for token in context.args]
+    args = list(context.args)
+    delivery = "upload"
+    if args and args[-1].casefold() in ("direct", "مستقیم"):
+        delivery = "direct"
+        args.pop()
+    elif args and args[-1].casefold() in ("upload", "آپلود"):
+        delivery = "upload"
+        args.pop()
+    selectors = [token.lstrip("@").casefold() for token in args]
     if not selectors or "all" in selectors:
         selected = channels
     else:
@@ -1096,6 +1212,7 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         context,
         selected,
         label="export",
+        delivery=delivery,
     )
 
 
@@ -1213,6 +1330,15 @@ async def scheduled_state_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
     await asyncio.to_thread(backup_state)
 
 
+def _delivery_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📤 آپلود در imgurl.ir (لینک رمزشده)", callback_data="deliver:upload")],
+            [InlineKeyboardButton("📎 ارسال مستقیم jpg در بله", callback_data="deliver:direct")],
+        ]
+    )
+
+
 @admin_only
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _track_message(context, update.message.message_id)
@@ -1228,16 +1354,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     pending_channels = context.user_data.pop("pending_channels", [])
     context.user_data["state"] = None
     if pending_channels:
-        await _enqueue_job(
-            context,
-            pending_channels,
-            label="export",
-            count=count,
-            max_zip_mb=int(
-                context.application.bot_data.get("max_zip_mb", DEFAULT_MAX_ZIP_MB)
-            ),
-            max_media_bytes=DEFAULT_MAX_MEDIA_BYTES,
+        context.user_data["pending_export"] = {
+            "channels": pending_channels,
+            "count": count,
+        }
+        prompt = await update.message.reply_text(
+            "روش دریافت خروجی را انتخاب کنید:\n\n"
+            "📤 آپلود در imgurl.ir — یک لینک رمزشده برایتان ارسال می‌شود (حجم قابل‌کنترل‌تر).\n"
+            "📎 ارسال مستقیم jpg در بله — بدون نیاز به سایت واسط؛ اگر حجم از ۵۰ مگابایت "
+            "بیشتر شود به چند فایل jpg تقسیم می‌شود.",
+            reply_markup=_delivery_keyboard(),
         )
+        _track_message(context, prompt.message_id)
     else:
         message = await update.message.reply_text(
             "انتخاب کانال منقضی شده است. دوباره /start را بزنید."
@@ -1262,6 +1390,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             ),
         )
         _track_message(context, message.message_id)
+    elif data.startswith("deliver:"):
+        delivery = data.split(":", 1)[1]
+        pending_export = context.user_data.pop("pending_export", None)
+        with contextlib.suppress(Exception):
+            await context.bot.delete_message(
+                chat_id=ADMIN_ID, message_id=query.message.message_id
+            )
+        if not pending_export:
+            message = await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text="این درخواست منقضی شده است. دوباره /start را بزنید.",
+            )
+            _track_message(context, message.message_id)
+            return
+        await _enqueue_job(
+            context,
+            pending_export["channels"],
+            label="export",
+            count=pending_export["count"],
+            max_zip_mb=int(
+                context.application.bot_data.get("max_zip_mb", DEFAULT_MAX_ZIP_MB)
+            ),
+            max_media_bytes=DEFAULT_MAX_MEDIA_BYTES,
+            delivery=delivery,
+        )
     elif data.startswith("toggle:"):
         channels = await get_channels()
         channel_id = int(data.split(":", 1)[1])
@@ -1315,6 +1468,51 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         _track_message(context, prompt.message_id)
 
 
+async def scheduled_temp_cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await asyncio.to_thread(cleanup_old_temp_files)
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """خطاهای داخل هندلرها را می‌گیرد و فقط لاگ/گزارش می‌کند تا کل ربات کرش نکند."""
+    logger.exception("unhandled error while processing update %r", update, exc_info=context.error)
+    with contextlib.suppress(Exception):
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"⚠️ یک خطای داخلی رخ داد اما ربات همچنان روشن است.\n{context.error}",
+        )
+
+
+async def _resume_pending_exports(app: Application) -> None:
+    """درخواست‌های export ناتمام از قبل از ری‌استارت را دوباره به صف اضافه می‌کند."""
+    state = _load_state()
+    pending = state.get("pending_exports", [])
+    if not pending:
+        return
+    fake_context = SimpleNamespace(bot=app.bot, application=app, user_data={})
+    for spec in list(pending):
+        try:
+            with contextlib.suppress(Exception):
+                await app.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        "🔄 ربات بعد از قطعی/ری‌استارت دوباره بالا آمد؛ "
+                        f"درخواست export ناتمام «{spec.get('label', 'export')}» "
+                        "از سر گرفته می‌شود."
+                    ),
+                )
+            await _enqueue_job(
+                fake_context,
+                spec.get("channels", []),
+                label=spec.get("label", "export"),
+                count=int(spec.get("count", DEFAULT_MESSAGE_COUNT)),
+                max_zip_mb=int(spec.get("max_zip_mb", DEFAULT_MAX_ZIP_MB)),
+                max_media_bytes=spec.get("max_media_bytes"),
+                delivery=spec.get("delivery", "upload"),
+            )
+        except Exception:
+            logger.exception("failed to resume pending export %s", spec.get("job_id"))
+
+
 async def main() -> None:
     global userbot
     cleanup_old_temp_files()
@@ -1350,6 +1548,7 @@ async def main() -> None:
     app.add_handler(CommandHandler("del", cmd_delete))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(error_handler)
 
     app.job_queue.run_repeating(auto_delete_messages, interval=60, first=60)
     app.job_queue.run_repeating(
@@ -1357,12 +1556,18 @@ async def main() -> None:
         interval=STATE_BACKUP_INTERVAL_SECONDS,
         first=STATE_BACKUP_INTERVAL_SECONDS,
     )
+    app.job_queue.run_repeating(
+        scheduled_temp_cleanup,
+        interval=TEMP_CLEANUP_INTERVAL_SECONDS,
+        first=TEMP_CLEANUP_INTERVAL_SECONDS,
+    )
     backup_state()
 
     await app.initialize()
     await app.start()
     await app.updater.start_polling(allowed_updates=["message", "callback_query"])
     logger.info("Bot running")
+    await _resume_pending_exports(app)
     try:
         await asyncio.Event().wait()
     finally:
@@ -1373,5 +1578,26 @@ async def main() -> None:
         await userbot.disconnect()
 
 
+async def run_forever() -> None:
+    """اگر main() به هر دلیلی (قطعی شبکه، خطای غیرمنتظره و ...) با استثنا متوقف
+    شود، به‌جای کرش کامل پردازش، بعد از یک مکث کوتاه دوباره از حالت اولیه
+    راه‌اندازی می‌شود. هدف این است که اگر اینترنت قطع بود و دسترسی دستی وجود
+    نداشت، ربات خودش خودش را سرپا نگه دارد."""
+    delay = CRASH_RESTART_MIN_DELAY
+    while True:
+        try:
+            await main()
+            logger.info("main() returned normally; restarting fresh")
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except Exception:
+            logger.exception("bot crashed; restarting in %s seconds", delay)
+        else:
+            delay = CRASH_RESTART_MIN_DELAY
+            continue
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, CRASH_RESTART_MAX_DELAY)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run_forever())
