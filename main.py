@@ -1376,8 +1376,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 @admin_only
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
     data = query.data or ""
+    # هر callback query را فقط یک‌بار می‌توان answer کرد. برای «ادامه» پاسخ را
+    # پایین‌تر (بسته به تعداد کانال‌های انتخاب‌شده) می‌دهیم تا پاسخ دوم باعث
+    # خطای "Query is too old ... or query id is invalid" نشود.
+    # اگر کوئری قدیمی شده باشد (مثلاً اینترنت کند بوده) خطا نادیده گرفته می‌شود.
+    if data != "confirm:selected":
+        with contextlib.suppress(Exception):
+            await query.answer()
     if data.startswith("cancel:"):
         job_id = data.split(":", 1)[1]
         cancelled = await _queue(context.application).cancel_job(job_id)
@@ -1449,8 +1455,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             channel for channel in channels if int(channel["id"]) in selected_ids
         ]
         if not selected_channels:
-            await query.answer("حداقل یک کانال را انتخاب کنید.", show_alert=True)
+            with contextlib.suppress(Exception):
+                await query.answer("حداقل یک کانال را انتخاب کنید.", show_alert=True)
             return
+        with contextlib.suppress(Exception):
+            await query.answer()
         with contextlib.suppress(Exception):
             await context.bot.delete_message(
                 chat_id=ADMIN_ID, message_id=query.message.message_id
@@ -1474,6 +1483,14 @@ async def scheduled_temp_cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """خطاهای داخل هندلرها را می‌گیرد و فقط لاگ/گزارش می‌کند تا کل ربات کرش نکند."""
+    err_text = str(context.error or "")
+    if (
+        "Query is too old" in err_text
+        or "query id is invalid" in err_text
+        or "Message is not modified" in err_text
+    ):
+        logger.warning("ignored harmless telegram error: %s", err_text)
+        return
     logger.exception("unhandled error while processing update %r", update, exc_info=context.error)
     with contextlib.suppress(Exception):
         await context.bot.send_message(
